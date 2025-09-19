@@ -44,6 +44,48 @@ class StatusCheckCreate(BaseModel):
     client_name: str
 
 
+# Car rating models
+class Car(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    make: str
+    model: str
+    year: int
+    image_url: str
+    hot_votes: int = 0
+    not_votes: int = 0
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class CarCreate(BaseModel):
+    make: str
+    model: str
+    year: int
+    image_url: str
+
+class Vote(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    car_id: str
+    vote_type: str  # "hot" or "not"
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+class VoteCreate(BaseModel):
+    car_id: str
+    vote_type: str
+
+class CarWithScore(BaseModel):
+    id: str
+    make: str
+    model: str
+    year: int
+    image_url: str
+    hot_votes: int
+    not_votes: int
+    total_votes: int
+    hot_percentage: float
+
+class VoteResponse(BaseModel):
+    success: bool
+    car: CarWithScore
+
 # AI agent models
 class ChatRequest(BaseModel):
     message: str
@@ -80,15 +122,82 @@ async def root():
 
 @api_router.post("/status", response_model=StatusCheck)
 async def create_status_check(input: StatusCheckCreate):
-    status_dict = input.dict()
+    status_dict = input.model_dump()
     status_obj = StatusCheck(**status_dict)
-    _ = await db.status_checks.insert_one(status_obj.dict())
+    _ = await db.status_checks.insert_one(status_obj.model_dump())
     return status_obj
 
 @api_router.get("/status", response_model=List[StatusCheck])
 async def get_status_checks():
     status_checks = await db.status_checks.find().to_list(1000)
     return [StatusCheck(**status_check) for status_check in status_checks]
+
+
+# Car rating routes
+@api_router.post("/cars", response_model=Car)
+async def create_car(car: CarCreate):
+    car_dict = car.model_dump()
+    car_obj = Car(**car_dict)
+    await db.cars.insert_one(car_obj.model_dump())
+    return car_obj
+
+@api_router.get("/cars/random", response_model=Car)
+async def get_random_car():
+    # Get a random car from the database
+    pipeline = [{"$sample": {"size": 1}}]
+    cars = await db.cars.aggregate(pipeline).to_list(1)
+    if not cars:
+        raise HTTPException(status_code=404, detail="No cars found")
+    return Car(**cars[0])
+
+@api_router.post("/cars/vote", response_model=VoteResponse)
+async def vote_on_car(vote: VoteCreate):
+    # Validate vote type
+    if vote.vote_type not in ["hot", "not"]:
+        raise HTTPException(status_code=400, detail="Vote type must be 'hot' or 'not'")
+
+    # Check if car exists
+    car_data = await db.cars.find_one({"id": vote.car_id})
+    if not car_data:
+        raise HTTPException(status_code=404, detail="Car not found")
+
+    # Record the vote
+    vote_obj = Vote(**vote.model_dump())
+    await db.votes.insert_one(vote_obj.model_dump())
+
+    # Update car vote counts
+    if vote.vote_type == "hot":
+        await db.cars.update_one(
+            {"id": vote.car_id},
+            {"$inc": {"hot_votes": 1}}
+        )
+    else:
+        await db.cars.update_one(
+            {"id": vote.car_id},
+            {"$inc": {"not_votes": 1}}
+        )
+
+    # Get updated car data
+    updated_car_data = await db.cars.find_one({"id": vote.car_id})
+    car = Car(**updated_car_data)
+
+    # Calculate score
+    total_votes = car.hot_votes + car.not_votes
+    hot_percentage = (car.hot_votes / total_votes * 100) if total_votes > 0 else 0
+
+    car_with_score = CarWithScore(
+        id=car.id,
+        make=car.make,
+        model=car.model,
+        year=car.year,
+        image_url=car.image_url,
+        hot_votes=car.hot_votes,
+        not_votes=car.not_votes,
+        total_votes=total_votes,
+        hot_percentage=round(hot_percentage, 1)
+    )
+
+    return VoteResponse(success=True, car=car_with_score)
 
 
 # AI agent routes
